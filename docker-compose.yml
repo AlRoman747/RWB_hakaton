@@ -1,0 +1,73 @@
+x-database-environment: &database-environment
+  PGHOST: db
+  PGPORT: 5432
+  PGDATABASE: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+  PGUSER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+  PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+x-application-service: &application-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: *database-environment
+  volumes:
+    - ./data:/data:ro
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  init: true
+
+services:
+  db:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --data-checksums
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+  loader:
+    <<: *application-service
+    command: ["/bin/sh", "-c", "python -m scripts.load_data && python -m scripts.run_sql"]
+    environment:
+      <<: *database-environment
+      DATA_DIR: /data
+      MODEL_DIR: /app/model
+      QUERY_DIR: /app/queries
+    depends_on:
+      db:
+        condition: service_healthy
+
+  tests:
+    <<: *application-service
+    command: ["python", "-m", "pytest", "-q", "-m", "integration"]
+    environment:
+      <<: *database-environment
+      DATA_DIR: /data
+      RUN_INTEGRATION: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+      loader:
+        condition: service_completed_successfully
+    profiles:
+      - test
+
+volumes:
+  postgres_data:

@@ -1,0 +1,225 @@
+
+===== FILE: model/01_capibara_core.sql =====
+
+-- Capibara core model: typed views over the immutable raw layer.
+-- Views are idempotent and preserve rows; business filters belong to marts.
+
+CREATE OR REPLACE VIEW core.dim_customers AS
+SELECT
+    customer_unique_id,
+    MIN(customer_zip_code_prefix) AS zip_code_prefix,
+    MIN(customer_city) AS city,
+    MIN(customer_state) AS state
+FROM raw.customers
+GROUP BY customer_unique_id;
+
+CREATE OR REPLACE VIEW core.dim_sellers AS
+SELECT
+    seller_id,
+    seller_zip_code_prefix AS zip_code_prefix,
+    seller_city AS city,
+    seller_state AS state
+FROM raw.sellers;
+
+CREATE OR REPLACE VIEW core.dim_products AS
+SELECT
+    p.product_id,
+    NULLIF(p.product_category_name, '') AS category_name,
+    t.product_category_name_english AS category_name_en,
+    NULLIF(p.product_weight_g, '')::numeric AS weight_g,
+    NULLIF(p.product_length_cm, '')::numeric AS length_cm,
+    NULLIF(p.product_height_cm, '')::numeric AS height_cm,
+    NULLIF(p.product_width_cm, '')::numeric AS width_cm
+FROM raw.products p
+LEFT JOIN raw.product_category_translation t
+    ON t.product_category_name = p.product_category_name;
+
+CREATE OR REPLACE VIEW core.fact_orders AS
+SELECT
+    o.order_id,
+    c.customer_unique_id,
+    o.order_status AS status,
+    NULLIF(o.order_purchase_timestamp, '')::timestamptz AS purchase_timestamp,
+    NULLIF(o.order_approved_at, '')::timestamptz AS approved_at,
+    NULLIF(o.order_delivered_carrier_date, '')::timestamptz AS delivered_carrier_at,
+    NULLIF(o.order_delivered_customer_date, '')::timestamptz AS delivered_customer_at,
+    NULLIF(o.order_estimated_delivery_date, '')::timestamptz AS estimated_delivery_at
+FROM raw.orders o
+JOIN raw.customers c
+    ON c.customer_id = o.customer_id;
+
+CREATE OR REPLACE VIEW core.fact_order_items AS
+SELECT
+    oi.order_id,
+    oi.order_item_id::integer AS item_number,
+    oi.product_id,
+    oi.seller_id,
+    NULLIF(oi.shipping_limit_date, '')::timestamptz AS shipping_limit_at,
+    NULLIF(oi.price, '')::numeric AS price,
+    NULLIF(oi.freight_value, '')::numeric AS freight_value
+FROM raw.order_items oi;
+
+CREATE OR REPLACE VIEW core.fact_payments AS
+SELECT
+    op.order_id,
+    op.payment_sequential::integer AS payment_sequence,
+    op.payment_type,
+    NULLIF(op.payment_installments, '')::integer AS installments,
+    NULLIF(op.payment_value, '')::numeric AS payment_value
+FROM raw.order_payments op;
+
+CREATE OR REPLACE VIEW core.fact_reviews AS
+SELECT
+    review_id,
+    order_id,
+    NULLIF(review_score, '')::smallint AS review_score,
+    review_comment_title,
+    review_comment_message,
+    NULLIF(review_creation_date, '')::timestamptz AS created_at,
+    NULLIF(review_answer_timestamp, '')::timestamptz AS answered_at
+FROM raw.order_reviews;
+
+
+===== FILE: queries/01_capibara_q1_monthly_revenue.sql =====
+
+-- Q1. Revenue and order count by month, September 2016 through August 2018.
+-- Revenue is the sum of delivered item prices, matching the case control total.
+
+CREATE OR REPLACE VIEW mart.capibara_q1_monthly_revenue AS
+WITH months AS (
+    SELECT generate_series(
+        DATE '2016-09-01',
+        DATE '2018-08-01',
+        INTERVAL '1 month'
+    )::date AS month_start
+),
+order_stats AS (
+    SELECT
+        date_trunc('month', purchase_timestamp)::date AS month_start,
+        count(*) AS orders_count
+    FROM core.fact_orders
+    WHERE status = 'delivered'
+      AND purchase_timestamp >= TIMESTAMPTZ '2016-09-01 00:00:00+00'
+      AND purchase_timestamp <  TIMESTAMPTZ '2018-09-01 00:00:00+00'
+    GROUP BY 1
+),
+revenue_stats AS (
+    SELECT
+        date_trunc('month', o.purchase_timestamp)::date AS month_start,
+        sum(oi.price) AS revenue
+    FROM core.fact_order_items oi
+    JOIN core.fact_orders o
+      ON o.order_id = oi.order_id
+    WHERE o.status = 'delivered'
+      AND o.purchase_timestamp >= TIMESTAMPTZ '2016-09-01 00:00:00+00'
+      AND o.purchase_timestamp <  TIMESTAMPTZ '2018-09-01 00:00:00+00'
+    GROUP BY 1
+)
+SELECT
+    to_char(m.month_start, 'YYYY-MM') AS month,
+    COALESCE(os.orders_count, 0) AS orders_count,
+    ROUND(COALESCE(rs.revenue, 0), 2) AS revenue
+FROM months m
+LEFT JOIN order_stats os
+  ON os.month_start = m.month_start
+LEFT JOIN revenue_stats rs
+  ON rs.month_start = m.month_start
+ORDER BY m.month_start;
+
+
+===== FILE: queries/02_capibara_q2_top10_sellers.sql =====
+
+-- Q2. Top 10 sellers by delivered item-price revenue.
+
+CREATE OR REPLACE VIEW mart.capibara_q2_top10_sellers AS
+SELECT
+    oi.seller_id,
+    s.city,
+    s.state,
+    count(DISTINCT oi.order_id) AS orders_count,
+    count(*) AS units_sold,
+    ROUND(sum(oi.price), 2) AS revenue
+FROM core.fact_order_items oi
+JOIN core.fact_orders o
+  ON o.order_id = oi.order_id
+LEFT JOIN core.dim_sellers s
+  ON s.seller_id = oi.seller_id
+WHERE o.status = 'delivered'
+GROUP BY
+    oi.seller_id,
+    s.city,
+    s.state
+ORDER BY revenue DESC, oi.seller_id
+LIMIT 10;
+
+
+===== FILE: queries/03_capibara_q3_avg_order_value.sql =====
+
+-- Q3. Average delivered order check, including item freight.
+-- Each source row is one unit; therefore units per order equal order lines here.
+
+CREATE OR REPLACE VIEW mart.capibara_q3_avg_order_value AS
+WITH order_totals AS (
+    SELECT
+        o.order_id,
+        count(*) AS lines_count,
+        count(*) AS units_count,
+        sum(oi.price + oi.freight_value) AS order_check
+    FROM core.fact_order_items oi
+    JOIN core.fact_orders o
+      ON o.order_id = oi.order_id
+    WHERE o.status = 'delivered'
+    GROUP BY o.order_id
+)
+SELECT
+    ROUND(avg(order_check), 2) AS avg_order_value,
+    ROUND(avg(lines_count), 2) AS avg_lines_per_order,
+    ROUND(avg(units_count), 2) AS avg_units_per_order
+FROM order_totals;
+
+
+===== FILE: queries/04_capibara_q4_repeat_customers.sql =====
+
+-- Q4. Unique customers and customers with at least two orders.
+
+CREATE OR REPLACE VIEW mart.capibara_q4_repeat_customers AS
+WITH customer_orders AS (
+    SELECT
+        o.customer_unique_id,
+        count(DISTINCT o.order_id) AS orders_count
+    FROM core.fact_orders o
+    GROUP BY o.customer_unique_id
+)
+SELECT
+    count(*) AS total_customers,
+    count(*) FILTER (WHERE orders_count >= 2) AS repeat_customers,
+    ROUND(
+        100.0 * count(*) FILTER (WHERE orders_count >= 2) / count(*),
+        2
+    ) AS repeat_share_pct
+FROM customer_orders;
+
+
+===== FILE: queries/05_capibara_q5_category_revenue.sql =====
+
+-- Q5. Delivered item-price revenue and revenue share by product category.
+-- Prefer the English translation; retain Portuguese names missing from the
+-- translation file. Only a genuinely empty source category becomes 'unknown'.
+
+CREATE OR REPLACE VIEW mart.capibara_q5_category_revenue AS
+SELECT
+    COALESCE(p.category_name_en, p.category_name, 'unknown') AS category,
+    ROUND(sum(oi.price), 2) AS revenue,
+    ROUND(
+        100.0 * sum(oi.price) / sum(sum(oi.price)) OVER (),
+        2
+    ) AS revenue_share_pct
+FROM core.fact_order_items oi
+JOIN core.fact_orders o
+  ON o.order_id = oi.order_id
+LEFT JOIN core.dim_products p
+  ON p.product_id = oi.product_id
+WHERE o.status = 'delivered'
+GROUP BY COALESCE(p.category_name_en, p.category_name, 'unknown')
+ORDER BY revenue DESC, category;
+
